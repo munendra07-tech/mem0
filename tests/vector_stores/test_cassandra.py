@@ -315,3 +315,88 @@ def test_insert_without_payloads(cassandra_instance):
     assert cassandra_instance.session.prepare.called
     assert cassandra_instance.session.execute.called
 
+
+
+# --- Metadata filters: operators, logical groups and wildcard ---------------------------------
+# Memory._process_metadata_filters() turns user filters into operator dicts ({"age": {"gte": 30}}),
+# "$or"/"$not" lists and "*" before calling the vector store. These tests check that
+# CassandraDB.search() and CassandraDB.list() honour them instead of silently matching nothing.
+
+FILTER_PAYLOADS = {
+    "a": {"user_id": "u1", "age": 20, "city": "Pune", "note": "Likes Tea"},
+    "b": {"user_id": "u1", "age": 35, "city": "Delhi", "note": "likes coffee"},
+    "c": {"user_id": "u1", "age": 50, "city": "Mumbai"},
+    "d": {"user_id": "u2", "age": 40, "city": "Pune", "note": "tea"},
+}
+
+
+def _filter_rows(vector=None):
+    rows = []
+    for row_id, payload in FILTER_PAYLOADS.items():
+        row = Mock()
+        row.id = row_id
+        row.vector = vector or [1.0, 0.0]
+        row.payload = json.dumps(payload)
+        rows.append(row)
+    return rows
+
+
+def _matching_ids(instance, method, filters, rows=None):
+    instance.session.execute = Mock(return_value=rows if rows is not None else _filter_rows())
+    if method == "search":
+        results = instance.search(query="q", vectors=[1.0, 0.0], top_k=10, filters=filters)
+    else:
+        results = instance.list(filters=filters, top_k=10)[0]
+    return sorted(r.id for r in results)
+
+
+FILTER_CASES = [
+    pytest.param({"user_id": "u1"}, ["a", "b", "c"], id="plain-equality-still-works"),
+    pytest.param({"user_id": "u1", "age": {"gte": 35}}, ["b", "c"], id="gte-includes-the-boundary"),
+    pytest.param({"user_id": "u1", "age": {"gt": 35}}, ["c"], id="gt-excludes-the-boundary"),
+    pytest.param({"user_id": "u1", "age": {"lte": 35}}, ["a", "b"], id="lte-includes-the-boundary"),
+    pytest.param({"user_id": "u1", "age": {"lt": 35}}, ["a"], id="lt-excludes-the-boundary"),
+    pytest.param({"user_id": "u1", "age": {"gt": 20, "lt": 50}}, ["b"], id="gt-and-lt-on-one-field"),
+    pytest.param({"user_id": "u1", "age": {"eq": 35}}, ["b"], id="eq"),
+    pytest.param({"user_id": "u1", "city": {"ne": "Pune"}}, ["b", "c"], id="ne"),
+    pytest.param({"user_id": "u1", "city": {"in": ["Pune", "Delhi"]}}, ["a", "b"], id="in"),
+    pytest.param({"user_id": "u1", "city": {"nin": ["Pune", "Delhi"]}}, ["c"], id="nin"),
+    pytest.param({"user_id": "u1", "city": ["Pune", "Delhi"]}, ["a", "b"], id="list-shorthand-means-in"),
+    pytest.param({"user_id": "u1", "note": {"contains": "Tea"}}, ["a"], id="contains-matches-exact-case"),
+    pytest.param({"user_id": "u1", "note": {"contains": "tea"}}, [], id="contains-is-case-sensitive"),
+    pytest.param({"user_id": "u1", "note": {"icontains": "tea"}}, ["a"], id="icontains-ignores-case"),
+    pytest.param({"user_id": "u1", "note": "*"}, ["a", "b"], id="wildcard-means-field-exists"),
+    pytest.param({"user_id": "u1", "$or": [{"city": "Pune"}, {"city": "Delhi"}]}, ["a", "b"], id="dollar-or"),
+    pytest.param({"user_id": "u1", "OR": [{"city": "Pune"}, {"city": "Delhi"}]}, ["a", "b"], id="or"),
+    pytest.param({"user_id": "u1", "$not": [{"city": "Pune"}]}, ["b", "c"], id="dollar-not"),
+    pytest.param({"user_id": "u1", "AND": [{"city": "Pune"}, {"age": {"gte": 10}}]}, ["a"], id="and"),
+    pytest.param({"user_id": "u1", "city": {"gt": 5}}, [], id="incompatible-types-match-nothing-not-crash"),
+]
+
+
+@pytest.mark.parametrize("method", ["search", "list"])
+@pytest.mark.parametrize("filters, expected", FILTER_CASES)
+def test_filters_are_applied(cassandra_instance, method, filters, expected):
+    assert _matching_ids(cassandra_instance, method, filters) == expected
+
+
+@pytest.mark.parametrize("method", ["search", "list"])
+def test_unsupported_operator_raises_instead_of_matching_nothing(cassandra_instance, method):
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        _matching_ids(cassandra_instance, method, {"user_id": "u1", "age": {"between": [1, 5]}})
+
+
+@pytest.mark.parametrize("method", ["search", "list"])
+def test_mixing_operators_and_unknown_operator_names_raises(cassandra_instance, method):
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        _matching_ids(cassandra_instance, method, {"user_id": "u1", "$or": [{"age": {"bogus": 1}}]})
+
+
+def test_search_scores_a_zero_vector_row_as_zero_not_nan(cassandra_instance):
+    row = Mock()
+    row.id = "z"
+    row.vector = [0.0, 0.0]
+    row.payload = json.dumps({"user_id": "u1"})
+    cassandra_instance.session.execute = Mock(return_value=[row])
+    results = cassandra_instance.search(query="q", vectors=[1.0, 0.0], top_k=5, filters={"user_id": "u1"})
+    assert [r.score for r in results] == [0.0]

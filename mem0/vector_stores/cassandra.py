@@ -1,8 +1,9 @@
 import json
 import logging
+import operator
 import re
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from pydantic import BaseModel
@@ -30,6 +31,89 @@ def _validate_identifier(name: str, label: str = "identifier") -> str:
             "must start with a letter or underscore, and be at most 128 characters."
         )
     return name
+
+
+
+_RANGE_OPERATORS = {"gt": operator.gt, "gte": operator.ge, "lt": operator.lt, "lte": operator.le}
+_SUPPORTED_OPERATORS = {"eq", "ne", "in", "nin", "contains", "icontains"} | set(_RANGE_OPERATORS)
+_LOGICAL_KEYS = {"AND": "AND", "$and": "AND", "OR": "OR", "$or": "OR", "NOT": "NOT", "$not": "NOT"}
+
+
+def _compile_condition(key: str, value: Any) -> Callable[[Dict], bool]:
+    """Build a predicate for one payload field from a scalar, a list, "*" or an operator dict."""
+    if not isinstance(value, dict):
+        if value == "*":
+            return lambda payload: key in payload  # wildcard: the field must exist
+        if isinstance(value, list):
+            return lambda payload: payload.get(key) in value  # list shorthand means "in"
+        return lambda payload: payload.get(key) == value
+
+    unknown = set(value) - _SUPPORTED_OPERATORS
+    if unknown:
+        raise ValueError(
+            f"Unsupported filter operator(s) for field '{key}': {unknown}. "
+            f"Supported operators: {sorted(_SUPPORTED_OPERATORS)}"
+        )
+
+    checks: List[Callable[[Dict], bool]] = []
+    for op, operand in value.items():
+        if op == "eq":
+            checks.append(lambda payload, operand=operand: payload.get(key) == operand)
+        elif op == "ne":
+            checks.append(lambda payload, operand=operand: payload.get(key) != operand)
+        elif op in ("in", "nin"):
+            if not isinstance(operand, (list, tuple, set)):
+                raise ValueError(f"'{op}' filter for field '{key}' needs a list, got {type(operand).__name__}")
+            if op == "in":
+                checks.append(lambda payload, operand=operand: payload.get(key) in operand)
+            else:
+                checks.append(lambda payload, operand=operand: payload.get(key) not in operand)
+        elif op in _RANGE_OPERATORS:
+            compare = _RANGE_OPERATORS[op]
+
+            def in_range(payload, compare=compare, operand=operand):
+                try:
+                    return compare(payload.get(key), operand)
+                except TypeError:  # missing field or incomparable types never match
+                    return False
+
+            checks.append(in_range)
+        elif op == "contains":
+            checks.append(
+                lambda payload, operand=operand: isinstance(payload.get(key), str) and str(operand) in payload[key]
+            )
+        else:  # icontains
+            checks.append(
+                lambda payload, operand=operand: isinstance(payload.get(key), str)
+                and str(operand).lower() in payload[key].lower()
+            )
+    return lambda payload: all(check(payload) for check in checks)
+
+
+def _compile_filter(filters: Dict) -> Callable[[Dict], bool]:
+    """Compile the filter dict that Memory passes to a vector store into a predicate over a payload.
+
+    Understands field equality, operator dicts (eq, ne, gt, gte, lt, lte, in, nin, contains,
+    icontains), the "*" wildcard, and the logical groups AND / OR / NOT (also spelled $and / $or /
+    $not). Raises ValueError for an unsupported operator, so a bad filter fails loudly instead of
+    silently matching nothing.
+    """
+    checks: List[Callable[[Dict], bool]] = []
+    for key, value in filters.items():
+        logical = _LOGICAL_KEYS.get(key)
+        if logical is None:
+            checks.append(_compile_condition(key, value))
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise ValueError(f"{key} filter value must be a list of filter dicts")
+        groups = [_compile_filter(item) for item in value]
+        if logical == "AND":
+            checks.append(lambda payload, groups=groups: all(g(payload) for g in groups))
+        elif logical == "OR":
+            checks.append(lambda payload, groups=groups: not groups or any(g(payload) for g in groups))
+        else:  # NOT: none of the groups may match
+            checks.append(lambda payload, groups=groups: not any(g(payload) for g in groups))
+    return lambda payload: all(check(payload) for check in checks)
 
 
 class OutputData(BaseModel):
@@ -241,6 +325,8 @@ class CassandraDB(VectorStoreBase):
         Returns:
             List[OutputData]: Search results
         """
+        # Compiled before the try block so an unsupported operator raises ValueError.
+        matches_filters = _compile_filter(filters) if filters else None
         try:
             # Fetch all vectors (in production, you'd want pagination or filtering)
             query_cql = f"""
@@ -259,16 +345,17 @@ class CassandraDB(VectorStoreBase):
 
                 vec = np.array(row.vector)
 
-                similarity = float(np.dot(query_vec, vec) / (np.linalg.norm(query_vec) * np.linalg.norm(vec)))
+                norm_product = np.linalg.norm(query_vec) * np.linalg.norm(vec)
+                # A zero vector has no direction; score it 0.0 instead of NaN (0 / 0).
+                similarity = float(np.dot(query_vec, vec) / norm_product) if norm_product else 0.0
 
                 # Apply filters if provided
-                if filters:
+                if matches_filters is not None:
                     try:
                         payload = json.loads(row.payload) if row.payload else {}
-                        match = all(payload.get(k) == v for k, v in filters.items())
-                        if not match:
-                            continue
                     except json.JSONDecodeError:
+                        continue
+                    if not matches_filters(payload):
                         continue
 
                 scored_results.append((row.id, similarity, row.payload))
@@ -446,6 +533,8 @@ class CassandraDB(VectorStoreBase):
         Returns:
             List[List[OutputData]]: List of vectors
         """
+        # Compiled before the try block so an unsupported operator raises ValueError.
+        matches_filters = _compile_filter(filters) if filters else None
         try:
             query = f"""
                 SELECT id, vector, payload
@@ -457,13 +546,12 @@ class CassandraDB(VectorStoreBase):
             results = []
             for row in rows:
                 # Apply filters if provided
-                if filters:
+                if matches_filters is not None:
                     try:
                         payload = json.loads(row.payload) if row.payload else {}
-                        match = all(payload.get(k) == v for k, v in filters.items())
-                        if not match:
-                            continue
                     except json.JSONDecodeError:
+                        continue
+                    if not matches_filters(payload):
                         continue
 
                 results.append(
